@@ -4,39 +4,27 @@ Supports:
 - Custom recorded gestures
 - Dataset-based gestures (MSR Gesture3D)
 """
+import os
+import numpy as np
+import feature_extraction
 
-def load_templates(use_custom=True, use_dataset=False):
-    """
-    Load templates from selected sources.
-
-    Returns:
-        list of template dictionaries:
-        [
-            {"label": "swipe_left", "features": [...]},
-            ...
-        ]
-    """
-
-    templates = []
-
-    if use_custom:
-        # load custom templates from folder
-        pass
-
-    if use_dataset:
-        # load dataset-based templates
-        pass
-
-    return templates
+TEMPLATE_FOLDER = "templates"
 
 
 def save_template(mask, label):
-    """
-    Save new gesture template.
 
-    Steps:
-    1. Extract features
-    2. Store mask and features
-    3. Associate with label
-    """
-    pass
+    features = feature_extraction.extract_features(mask)
+
+    if features is None:
+        print("Could not extract features.")
+        return
+
+    if not os.path.exists(TEMPLATE_FOLDER):
+        os.makedirs(TEMPLATE_FOLDER)
+
+    filename = os.path.join(TEMPLATE_FOLDER, f"{label}.npy")
+
+    np.save(filename, features)
+
+    print(f"Saved template for {label}")
+
