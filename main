@@ -1,0 +1,15 @@
+while True:
+
+    depth_frame = kinect_camera.get_depth_frame()
+
+    mask = preprocessing.isolate_hand(depth_frame)
+
+    features = feature_extraction.extract_features(mask)
+
+    gesture = recognition.match_gesture(
+        features,
+        templates,
+        config.MATCH_THRESHOLD
+    )
+
+    print("Detected:", gesture)
