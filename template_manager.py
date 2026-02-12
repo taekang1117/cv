@@ -28,3 +28,25 @@ def save_template(mask, label):
 
     print(f"Saved template for {label}")
 
+def load_templates():
+
+    templates = []
+
+    if not os.path.exists(TEMPLATE_FOLDER):
+        return templates
+
+    for file in os.listdir(TEMPLATE_FOLDER):
+        if file.endswith(".npy"):
+
+            label = file.replace(".npy", "")
+            features = np.load(os.path.join(TEMPLATE_FOLDER, file))
+
+            templates.append({
+                "label": label,
+                "features": features
+            })
+
+    return templates
+
+
+
