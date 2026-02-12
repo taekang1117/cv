@@ -1,31 +1,42 @@
+
 """
-Compares live gesture features against stored templates.
+Recognition Module
+
+Compares extracted feature vectors to stored templates
+using Euclidean distance.
 """
+
+import numpy as np
+
 
 def match_gesture(features, templates, threshold):
     """
     Compare extracted features to each template.
 
-    Steps:
-    1. Compute distance between feature vectors
-    2. Select best match
-    3. If distance < threshold → return label
-    4. Otherwise return "unknown"
+    Returns:
+        best matching label or "unknown"
     """
 
     if features is None:
         return "unknown"
 
     best_label = "unknown"
-    best_score = None
+    best_score = float("inf")
 
     for template in templates:
         template_features = template["features"]
 
-        # score = compute_distance(features, template_features)
+        if template_features is None:
+            continue
 
-        # update best match
+        # Euclidean distance
+        score = np.linalg.norm(features - template_features)
 
-    # compare best_score to threshold
+        if score < best_score:
+            best_score = score
+            best_label = template["label"]
 
-    return best_label
+    if best_score < threshold:
+        return best_label
+    else:
+        return "unknown"
