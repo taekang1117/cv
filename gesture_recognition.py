@@ -1,167 +1,219 @@
 """
-gesture_recognition.py
------------------------
-Drop-in gesture recognition module for your Kinect v1 project.
+gesture_recognition.py  (MSR Gesture 3D edition)
+-------------------------------------------------
+Loads the MSR Gesture 3D dataset (.mat files), extracts per-class edge
+templates, and classifies live Kinect depth frames using template matching.
 
-Techniques used:
-  - Canny edge detection  → extract hand silhouettes from depth images
-  - cv2.matchTemplate     → compare live hand ROI against dataset templates
-  - Skeleton joint data   → crop a tight ROI around the hand so matching is fast & accurate
+Dataset format
+--------------
+Files: sub_depth_m_n.mat   (m = subject index, n = 1..36)
+Label mapping (n -> gesture):
+  1-3  -> ASL_Z       4-6  -> ASL_J       7-9  -> ASL_Where
+  10-12-> ASL_Store   13-15-> ASL_Pig     16-18-> ASL_Past
+  19-21-> ASL_Hungary 22-24-> ASL_Green   25-27-> ASL_Finish
+  28-30-> ASL_Blue    31-33-> ASL_Bathroom 34-36-> ASL_Milk
 
-HOW TO INTEGRATE
-----------------
-1.  Point DATASET_ROOT at your depth image dataset folder.
-    Expected structure (one sub-folder per gesture label):
+Each .mat file contains a 3-D array  depth_part  of shape (W, H, nFrames).
+The hand has already been segmented and cropped by the dataset authors.
 
-        dataset/
-          open_palm/
-            img001.png
-            img002.png
-            ...
-          fist/
-            img001.png
-            ...
-          pointing/
-            ...
+HOW TO INTEGRATE INTO YOUR MAIN SCRIPT
+---------------------------------------
+  from gesture_recognition import GestureRecognizer
 
-2.  At the top of your main script add:
-        from gesture_recognition import GestureRecognizer
-        recognizer = GestureRecognizer(DATASET_ROOT)
+  # After sensor.Start():
+  recognizer = GestureRecognizer(r"C:\\path\\to\\MSRGesture3D")
 
-3.  Inside depth_frame_ready(), after you have depth_mm, call:
-        label, score = recognizer.classify(depth_mm, joint_positions)
-        if label:
-            current_gesture = f"{label}  ({score:.2f})"
+  # Inside depth_frame_ready(), after depth_mm is computed:
+  cv_label, cv_score = recognizer.classify(depth_mm, joint_positions)
+  if cv_label:
+      current_gesture = f"CV: {cv_label}  ({cv_score:.2f})"
 
-    That's it — the rest of your code stays the same.
+  # Optional debug window:
+  debug_img = recognizer.debug_view(depth_mm, joint_positions)
+  cv2.imshow("Hand ROI | Edges", debug_img)
 """
 
-import os
+import re
 import cv2
 import numpy as np
 from pathlib import Path
+from scipy.io import loadmat
 
 
 # ── Tunable parameters ────────────────────────────────────────────────────────
 
-# Path to your dataset root folder
-DATASET_ROOT = r"C:\path\to\your\dataset"
+# Path to the folder containing sub_depth_m_n.mat files
+DATASET_ROOT = r"C:\path\to\MSRGesture3D"
 
-# Size (pixels) of the square ROI cropped around the hand joint
-ROI_SIZE = 96
+# Size (px) of the square ROI cropped around the hand joint in the live feed
+# Dataset frames are small (~50-80px), so 64 is a good match
+ROI_SIZE = 64
 
-# Canny thresholds — lower = more edges detected, higher = fewer/cleaner edges
-CANNY_LOW  = 30
-CANNY_HIGH = 90
+# Canny thresholds — lower = more edges, higher = cleaner/fewer edges
+# Tune these by watching the debug window
+CANNY_LOW  = 20
+CANNY_HIGH = 60
 
-# How many templates to load per gesture class (None = load all)
-MAX_TEMPLATES_PER_CLASS = 20
+# Frame sampling from each .mat sequence
+#   "middle" -> 1 frame from the centre (fast, fine for static ASL poses)
+#   "spread" -> FRAMES_PER_SEQUENCE evenly-spaced frames (better for dynamic
+#               gestures like ASL_J and ASL_Z which have motion paths)
+FRAME_SAMPLE_MODE    = "spread"
+FRAMES_PER_SEQUENCE  = 5
 
-# Minimum match score [0-1] to report a gesture (below this → "Unknown")
-MIN_CONFIDENCE = 0.45
+# Minimum match score [0-1] to report a gesture (below this -> "Unknown")
+MIN_CONFIDENCE = 0.40
 
-# ── End of tunable parameters ─────────────────────────────────────────────────
+# ── Label mapping (n index in filename -> gesture name) ──────────────────────
+
+N_TO_LABEL = {}
+_MAP = [
+    (range(1,  4),  "ASL_Z"),
+    (range(4,  7),  "ASL_J"),
+    (range(7,  10), "ASL_Where"),
+    (range(10, 13), "ASL_Store"),
+    (range(13, 16), "ASL_Pig"),
+    (range(16, 19), "ASL_Past"),
+    (range(19, 22), "ASL_Hungary"),
+    (range(22, 25), "ASL_Green"),
+    (range(25, 28), "ASL_Finish"),
+    (range(28, 31), "ASL_Blue"),
+    (range(31, 34), "ASL_Bathroom"),
+    (range(34, 37), "ASL_Milk"),
+]
+for _rng, _lbl in _MAP:
+    for _n in _rng:
+        N_TO_LABEL[_n] = _lbl
 
 
 class GestureRecognizer:
     """
-    Loads a depth-image dataset, extracts Canny-edge templates,
-    and classifies live hand crops using template matching.
+    Loads MSR Gesture 3D .mat files, builds Canny-edge templates per class,
+    and classifies a live depth ROI via template matching.
     """
 
     def __init__(self, dataset_root: str = DATASET_ROOT):
         self.roi_size  = ROI_SIZE
-        self.templates = {}          # { label: [edge_img, ...] }
+        self.templates: dict = {}   # { label: [edge_img, ...] }
         self._load_templates(dataset_root)
 
     # ── Dataset loading ───────────────────────────────────────────────────────
 
     def _load_templates(self, root: str):
-        """
-        Walk dataset_root, treat every sub-folder name as a gesture label,
-        load depth images, apply Canny, and store as templates.
-        """
         root = Path(root)
         if not root.exists():
-            print(f"[GestureRecognizer] ⚠  Dataset path not found: {root}")
-            print("                       Set DATASET_ROOT to your dataset folder.")
+            print(f"[GestureRecognizer]  Dataset path not found: {root}")
             return
 
-        extensions = {".png", ".jpg", ".jpeg", ".bmp", ".tiff"}
-        loaded_total = 0
+        mat_files = list(root.glob("sub_depth_*.mat"))
+        if not mat_files:
+            mat_files = list(root.rglob("sub_depth_*.mat"))
 
-        for label_dir in sorted(root.iterdir()):
-            if not label_dir.is_dir():
+        if not mat_files:
+            print(f"[GestureRecognizer]  No sub_depth_*.mat files found in {root}")
+            return
+
+        counts  = {}
+        skipped = 0
+
+        for mat_path in sorted(mat_files):
+            # Extract n from "sub_depth_<m>_<n>"
+            match = re.search(r"sub_depth_\d+_(\d+)", mat_path.stem)
+            if not match:
+                skipped += 1
                 continue
 
-            label = label_dir.name
-            templates = []
-            image_files = [
-                f for f in sorted(label_dir.iterdir())
-                if f.suffix.lower() in extensions
-            ]
+            n     = int(match.group(1))
+            label = N_TO_LABEL.get(n)
+            if label is None:
+                skipped += 1
+                continue
 
-            if MAX_TEMPLATES_PER_CLASS:
-                image_files = image_files[:MAX_TEMPLATES_PER_CLASS]
+            frames = self._load_mat_frames(mat_path)
+            if not frames:
+                skipped += 1
+                continue
 
-            for img_path in image_files:
-                img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
-                if img is None:
-                    continue
+            edges = [self._to_edge_template(f) for f in frames]
+            edges = [e for e in edges if e is not None]
 
-                edge_template = self._to_edge_template(img)
-                if edge_template is not None:
-                    templates.append(edge_template)
+            if edges:
+                self.templates.setdefault(label, []).extend(edges)
+                counts[label] = counts.get(label, 0) + len(edges)
 
-            if templates:
-                self.templates[label] = templates
-                loaded_total += len(templates)
-                print(f"[GestureRecognizer] ✓  '{label}': {len(templates)} templates loaded")
+        if skipped:
+            print(f"[GestureRecognizer]    {skipped} files skipped")
 
-        print(f"[GestureRecognizer] ✓  Total: {loaded_total} templates across {len(self.templates)} classes\n")
+        total = sum(counts.values())
+        for label, cnt in sorted(counts.items()):
+            print(f"[GestureRecognizer] ok '{label}': {cnt} templates")
+        print(f"[GestureRecognizer] Total: {total} templates, {len(self.templates)} classes\n")
 
-    def _to_edge_template(self, gray_img: np.ndarray) -> np.ndarray | None:
+    def _load_mat_frames(self, mat_path: Path):
         """
-        Resize → smooth → Canny → return a fixed-size edge image.
-        Works for both 8-bit and 16-bit depth images.
+        Read depth_part from a .mat file.
+        Returns a list of normalised uint8 2-D arrays (one per sampled frame).
         """
-        # Normalise to 8-bit if needed (16-bit depth PNGs from the Kinect)
-        if gray_img.dtype == np.uint16:
-            # Stretch to full 8-bit range so Canny sees contrast
-            norm = cv2.normalize(gray_img, None, 0, 255, cv2.NORM_MINMAX)
-            gray_img = norm.astype(np.uint8)
+        try:
+            mat = loadmat(str(mat_path))
+        except Exception as e:
+            print(f"[GestureRecognizer]  Could not load {mat_path.name}: {e}")
+            return []
 
-        if gray_img.size == 0:
+        # Locate the depth array — key is "depth_part" per the dataset docs
+        data = mat.get("depth_part")
+        if data is None:
+            # Fallback: find first 3-D numeric array
+            for key, val in mat.items():
+                if not key.startswith("_") and isinstance(val, np.ndarray) and val.ndim == 3:
+                    data = val
+                    break
+
+        if data is None or data.ndim != 3:
+            return []
+
+        # MATLAB stores as (W, H, nFrames) — convert to (nFrames, H, W)
+        data = np.transpose(data, (2, 1, 0)).astype(np.float32)
+        n_frames = data.shape[0]
+
+        if FRAME_SAMPLE_MODE == "middle" or n_frames == 1:
+            indices = [n_frames // 2]
+        else:
+            indices = np.linspace(0, n_frames - 1, FRAMES_PER_SEQUENCE, dtype=int).tolist()
+
+        frames = []
+        for idx in indices:
+            frame = data[idx]
+            valid = frame[frame > 0]
+            if valid.size == 0:
+                continue
+            lo, hi = valid.min(), valid.max()
+            if hi - lo < 1:
+                continue
+            norm      = np.zeros_like(frame, dtype=np.uint8)
+            mask      = frame > 0
+            norm[mask] = ((frame[mask] - lo) / (hi - lo) * 255).astype(np.uint8)
+            frames.append(norm)
+
+        return frames
+
+    def _to_edge_template(self, gray: np.ndarray):
+        """Resize -> GaussianBlur -> Canny -> fixed-size edge image."""
+        if gray is None or gray.size == 0:
             return None
-
-        resized = cv2.resize(gray_img, (self.roi_size, self.roi_size),
+        resized = cv2.resize(gray, (self.roi_size, self.roi_size),
                              interpolation=cv2.INTER_AREA)
         blurred = cv2.GaussianBlur(resized, (5, 5), 0)
-        edges   = cv2.Canny(blurred, CANNY_LOW, CANNY_HIGH)
-        return edges
+        return cv2.Canny(blurred, CANNY_LOW, CANNY_HIGH)
 
     # ── Live classification ───────────────────────────────────────────────────
 
-    def classify(
-        self,
-        depth_mm: np.ndarray,
-        joint_positions: dict,
-        hand_key=None           # pass a Microsoft.Kinect.JointType if you like
-    ) -> tuple[str | None, float]:
+    def classify(self, depth_mm: np.ndarray, joint_positions: dict, hand_key=None):
         """
-        Crop the hand region from the live depth frame, apply edge detection,
-        then run template matching against every loaded gesture class.
+        Extract the hand ROI from the live depth frame, run Canny edge detection,
+        and match against all templates.
 
-        Parameters
-        ----------
-        depth_mm        : float32 array (H×W) of per-pixel depth in mm
-        joint_positions : dict produced by skeleton_frame_ready()
-        hand_key        : the JointType key for the hand to inspect
-                          (auto-selects HandRight if None)
-
-        Returns
-        -------
-        (label, score)  label is None when no hand is visible or confidence too low
+        Returns (label, score).  label is None if score < MIN_CONFIDENCE.
         """
         if not self.templates:
             return None, 0.0
@@ -174,21 +226,15 @@ class GestureRecognizer:
         if live_edges is None:
             return None, 0.0
 
-        return self._match_against_templates(live_edges)
+        return self._best_match(live_edges)
 
-    def _extract_hand_roi(
-        self,
-        depth_mm: np.ndarray,
-        joint_positions: dict,
-        hand_key
-    ) -> np.ndarray | None:
+    def _extract_hand_roi(self, depth_mm: np.ndarray, joint_positions: dict, hand_key):
         """
-        Use the skeleton hand-joint pixel position to crop a square ROI
-        from the depth image centred on the hand.
+        Use the skeleton hand-joint pixel coordinate to crop a square ROI
+        from the live depth image, then normalise to uint8.
         """
-        # Auto-select hand joint key
+        # Auto-detect hand joint key from the dict
         if hand_key is None:
-            # Try to find HandRight or HandLeft by string matching the key repr
             for k in joint_positions:
                 if "HandRight" in str(k):
                     hand_key = k
@@ -205,19 +251,15 @@ class GestureRecognizer:
         hand = joint_positions[hand_key]
         cx, cy = hand["x"], hand["y"]
         half   = self.roi_size // 2
+        H, W   = depth_mm.shape
 
-        H, W = depth_mm.shape
-        x1 = max(0, cx - half)
-        y1 = max(0, cy - half)
-        x2 = min(W, cx + half)
-        y2 = min(H, cy + half)
+        x1, y1 = max(0, cx - half), max(0, cy - half)
+        x2, y2 = min(W, cx + half), min(H, cy + half)
 
         if (x2 - x1) < 10 or (y2 - y1) < 10:
             return None
 
-        crop = depth_mm[y1:y2, x1:x2].copy()
-
-        # Normalise the cropped float32 depth to uint8 for edge detection
+        crop  = depth_mm[y1:y2, x1:x2].astype(np.float32)
         valid = crop[crop > 0]
         if valid.size == 0:
             return None
@@ -226,21 +268,16 @@ class GestureRecognizer:
         if hi - lo < 1:
             return None
 
-        norm = np.zeros_like(crop, dtype=np.uint8)
-        mask = crop > 0
-        norm[mask] = ((crop[mask] - lo) / (hi - lo) * 255).astype(np.uint8)
+        norm       = np.zeros_like(crop, dtype=np.uint8)
+        mask       = crop > 0
+        norm[mask]  = ((crop[mask] - lo) / (hi - lo) * 255).astype(np.uint8)
         return norm
 
-    def _match_against_templates(
-        self, live_edges: np.ndarray
-    ) -> tuple[str | None, float]:
+    def _best_match(self, live_edges: np.ndarray):
         """
-        Compare live_edges against every template using TM_CCOEFF_NORMED.
-        Returns the best-matching label and its normalised score [0-1].
-
-        Because live_edges and every template are the same size (ROI_SIZE²),
-        matchTemplate with TM_CCOEFF_NORMED returns a 1×1 result — i.e. a
-        single similarity score — which is exactly what we want.
+        TM_CCOEFF_NORMED against every template.
+        Both images are ROI_SIZE x ROI_SIZE so the result is a 1x1 score.
+        Uses the mean of the top-5 per class for robustness.
         """
         best_label = None
         best_score = -1.0
@@ -248,69 +285,54 @@ class GestureRecognizer:
         for label, tmpl_list in self.templates.items():
             scores = []
             for tmpl in tmpl_list:
-                # Both images are ROI_SIZE × ROI_SIZE — result is a 1×1 matrix
-                result = cv2.matchTemplate(
+                res = cv2.matchTemplate(
                     live_edges.astype(np.float32),
                     tmpl.astype(np.float32),
                     cv2.TM_CCOEFF_NORMED
                 )
-                scores.append(float(result[0, 0]))
+                scores.append(float(res[0, 0]))
 
-            # Use the mean of the top-5 scores for robustness
-            top_scores = sorted(scores, reverse=True)[:5]
-            class_score = float(np.mean(top_scores))
-
+            class_score = float(np.mean(sorted(scores, reverse=True)[:5]))
             if class_score > best_score:
                 best_score = class_score
                 best_label = label
 
         if best_score < MIN_CONFIDENCE:
             return None, best_score
-
         return best_label, best_score
 
-    # ── Debug visualisation ───────────────────────────────────────────────────
+    # ── Debug view ────────────────────────────────────────────────────────────
 
-    def debug_view(
-        self,
-        depth_mm: np.ndarray,
-        joint_positions: dict,
-        hand_key=None
-    ) -> np.ndarray:
+    def debug_view(self, depth_mm: np.ndarray, joint_positions: dict, hand_key=None):
         """
-        Returns a small debug image showing:
-          left  — normalised hand ROI
-          right — Canny edges of that ROI
-        Useful for verifying that cropping and edge detection look correct.
-        Call this inside depth_frame_ready() and display with cv2.imshow().
+        Returns a side-by-side BGR image:
+            [normalised hand depth crop]  |  [Canny edges]
+        Useful for tuning CANNY_LOW / CANNY_HIGH.
         """
-        blank = np.zeros((self.roi_size, self.roi_size * 2 + 4, 3), dtype=np.uint8)
+        h     = self.roi_size
+        blank = np.zeros((h, h * 2 + 4, 3), dtype=np.uint8)
 
         roi = self._extract_hand_roi(depth_mm, joint_positions, hand_key)
         if roi is None:
-            cv2.putText(blank, "No hand", (4, self.roi_size // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+            cv2.putText(blank, "No hand", (4, h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 80, 80), 1)
             return blank
 
-        edges = self._to_edge_template(roi)
-
-        left  = cv2.cvtColor(roi,   cv2.COLOR_GRAY2BGR)
-        right = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-        divider = np.full((self.roi_size, 4, 3), 80, dtype=np.uint8)
+        edges   = self._to_edge_template(roi)
+        left    = cv2.cvtColor(cv2.resize(roi,   (h, h)), cv2.COLOR_GRAY2BGR)
+        right   = cv2.cvtColor(cv2.resize(edges, (h, h)), cv2.COLOR_GRAY2BGR)
+        divider = np.full((h, 4, 3), 80, dtype=np.uint8)
         return np.hstack([left, divider, right])
 
 
-# ── Quick standalone test (run this file directly to verify loading) ──────────
+# ── Quick standalone test ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
-
     root = sys.argv[1] if len(sys.argv) > 1 else DATASET_ROOT
-    print(f"Loading templates from: {root}\n")
+    print(f"Loading MSR Gesture 3D from: {root}\n")
     rec = GestureRecognizer(root)
-
-    if not rec.templates:
-        print("No templates loaded — check DATASET_ROOT path and folder structure.")
+    if rec.templates:
+        print("Classes:", list(rec.templates.keys()))
     else:
-        print("Template loading OK.")
-        print("Classes found:", list(rec.templates.keys()))
+        print("No templates loaded. Check DATASET_ROOT path.")
