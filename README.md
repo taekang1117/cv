@@ -93,7 +93,7 @@ python main.py --input images/sample_bolt.jpg
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 cv/
