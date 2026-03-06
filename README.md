@@ -97,13 +97,13 @@ python main.py --input images/sample_bolt.jpg
 
 ```
 cv/
-├── classifiers/
-│   ├── random_forest.py
-│   ├── knn.py
-│   └── svm.py
-├── pipeline.py
-├── main.py
-├── requirements.txt
+├── final_version/
+│   ├── collect_data.py
+│   ├── bolt_nut_knn.pkl
+│   ├── bolt_nut_svm.pkl
+│   ├── bolt_nut_model.pkl
+│   ├── train_model.py
+│   └── main_gui.py
 └── README.md
 ```
 
