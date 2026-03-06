@@ -1,6 +1,7 @@
 # train_model.py - Train RandomForest, KNN, and SVM for Bolt vs Screw
 # Run: python3 train_model.py
 import pandas as pd
+import numpy as np
 import pickle
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
@@ -82,6 +83,24 @@ def main():
     svm = SVC(kernel='rbf', C=1.0, gamma='scale', probability=True, random_state=42)
     svm.fit(X_train_scaled, y_train)
     evaluate("Support Vector Machine (RBF kernel)", svm, X_test_scaled, y_test)
+    
+    # ----------------------------------------
+    # 4. Voting Ensemble (RF + KNN + SVM)
+    # ----------------------------------------
+    print("\nEvaluating Voting Ensemble...")
+    rf_probs  = rf.predict_proba(X_test)
+    knn_probs = knn.predict_proba(X_test_scaled)
+    svm_probs = svm.predict_proba(X_test_scaled)
+    
+    avg_probs = (rf_probs + knn_probs + svm_probs) / 3.0
+    ensemble_preds = np.argmax(avg_probs, axis=1)
+    
+    print(f"\n{'='*50}")
+    print(f"Results - Voting Ensemble")
+    print(f"{'='*50}")
+    print(classification_report(y_test, ensemble_preds, target_names=['Nut', 'Bolt']))
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_test, ensemble_preds))
 
     # ----------------------------------------
     # Save all three models

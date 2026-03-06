@@ -9,7 +9,7 @@ import sys
 # =========================
 # Configuration
 # =========================
-WEBCAM_INDEX = 0
+WEBCAM_INDEX = 1
 FRAME_W, FRAME_H            = 960, 540
 ROI_X, ROI_Y, ROI_W, ROI_H = 260, 90, 440, 360
 
@@ -27,7 +27,7 @@ SVM_MODEL_FILE = "bolt_nut_svm.pkl"
 BOLT_COLOR  = (0, 200, 255)   # yellow-gold
 NUT_COLOR = (80, 80, 80)    # dark grey
 
-CLASSIFIER_NAMES = ["Random Forest", "KNN (k=5)", "SVM (RBF)"]
+CLASSIFIER_NAMES = ["Random Forest", "KNN (k=5)", "SVM (RBF)", "Voting Ensemble (RF+KNN+SVM)"]
 
 # =========================
 # Model Loading
@@ -98,10 +98,31 @@ def get_features_vector(cnt):
     aspect_ratio_invariant = float(max(w, h)) / (min(w, h) + 1e-9)
     return [area, aspect_ratio_invariant, circularity, solidity, perim]
 
-def run_classifier(model, scaler, feature_list):
+def run_classifier(model, scaler, feature_list, models=None, scalers=None, active_clf=None):
     import pandas as pd
     col_names = ['area', 'aspect_ratio', 'circularity', 'solidity', 'perimeter']
     X = pd.DataFrame(feature_list, columns=col_names)
+    
+    if active_clf == 3: # Voting Ensemble
+        rf_model, knn_model, svm_model = models
+        rf_scaler, knn_scaler, svm_scaler = scalers
+        
+        # RF Predictions
+        rf_probs = rf_model.predict_proba(X)
+        
+        # KNN Predictions
+        X_knn = knn_scaler.transform(X)
+        knn_probs = knn_model.predict_proba(X_knn)
+        
+        # SVM Predictions
+        X_svm = svm_scaler.transform(X)
+        svm_probs = svm_model.predict_proba(X_svm)
+        
+        # Average probabilities
+        avg_probs = (rf_probs + knn_probs + svm_probs) / 3.0
+        preds = np.argmax(avg_probs, axis=1)
+        return preds, avg_probs
+
     if scaler is not None:
         X = scaler.transform(X)
     preds = model.predict(X)
@@ -199,11 +220,14 @@ def main():
             nuts_count = 0
 
             if feature_list:
-                # Run only the active classifier for display
+                # Run the active classifier (or ensemble)
                 preds, probs = run_classifier(
-                    models[active_clf],
-                    scalers[active_clf],
-                    feature_list
+                    models[active_clf] if active_clf < 3 else None,
+                    scalers[active_clf] if active_clf < 3 else None,
+                    feature_list,
+                    models=models,
+                    scalers=scalers,
+                    active_clf=active_clf
                 )
                 bolts_count, nuts_count = draw_results(
                     vis_roi, bbox_list, preds, probs
@@ -218,7 +242,7 @@ def main():
                         (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
             # Small key reminder at bottom of frame
-            cv2.putText(full_bgr, "1=RF  2=KNN  3=SVM  b=Background  q=Quit",
+            cv2.putText(full_bgr, "1=RF  2=KNN  3=SVM  4=Ensemble  b=Background  q=Quit",
                         (20, FRAME_H - 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
@@ -243,6 +267,9 @@ def main():
         if key == ord('3'):
             active_clf = 2
             print("Switched to: SVM")
+        if key == ord('4'):
+            active_clf = 3
+            print("Switched to: Voting Ensemble")
 
     cap.release()
     cv2.destroyAllWindows()

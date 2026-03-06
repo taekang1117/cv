@@ -9,7 +9,7 @@ import sys
 # =========================
 # Configuration
 # =========================
-WEBCAM_INDEX = 0        # change to 1 if wrong camera opens
+WEBCAM_INDEX = 1        # change to 1 if wrong camera opens
 FRAME_W, FRAME_H        = 960, 540
 ROI_X, ROI_Y, ROI_W, ROI_H = 260, 90, 440, 360
 
