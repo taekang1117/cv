@@ -1,13 +1,8 @@
-kinect_gesture_project/
-│
-├── main.py
-├── config.py
-├── kinect_camera.py
-├── preprocessing.py
-├── feature_extraction.py
-├── template_manager.py
-├── recognition.py
-├── actions.py
-└── hardware_interface.py
-
-
+# Pipeline
+Object detected
+      │
+      ├──► Random Forest ──► 80% Bolt ──┐
+      │                                  │
+      ├──► KNN           ──► 60% Bolt ──┼──► Average 65% Bolt ──►  BOLT
+      │                                  │
+      └──► SVM           ──► 55% Bolt ──┘
